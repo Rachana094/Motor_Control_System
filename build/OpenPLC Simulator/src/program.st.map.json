@@ -1,0 +1,9 @@
+{
+  "pouOffsets": {
+    "motor_ladder": {
+      "kind": "PROGRAM",
+      "startLine": 1,
+      "endLine": 29
+    }
+  }
+}

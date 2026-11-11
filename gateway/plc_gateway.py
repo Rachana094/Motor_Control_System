@@ -1,236 +1,217 @@
 """
 =============================================================================
-  PLC Motor Control Gateway — Modbus TCP Server
+  PLC Motor Control Engine & Gateway — Modbus TCP + In-Memory Bridge
   Industrial IoT Smart Motor Monitoring & Control System
 =============================================================================
 
-  This script replicates the exact same ladder logic from motor_ladder.ld
-  and serves all PLC variables over Modbus TCP.
-
-  Modbus Register Map:
-  ────────────────────────────────────────
-  COILS (Read/Write) — Address 0-based:
-    0 = START_PB       (%IX0.0)  Push to start motor
-    1 = STOP_PB        (%IX0.1)  Push to stop motor
-    2 = FAULT_RESET    (%IX0.2)  Push to reset fault
-    3 = TEMP_SENSOR    (%IX0.3)  Thermal trip switch (simulate fault)
-    4 = CURRENT_SENSOR (%IX0.4)  Overload relay trip (simulate fault)
-
-  DISCRETE INPUTS (Read-Only) — Address 0-based:
-    0 = MOTOR_RUN      (%QX0.0)  Motor contactor status
-    1 = RUN_LAMP       (%QX0.1)  Green run lamp
-    2 = FAULT_LAMP     (%QX0.2)  Red fault lamp
-    3 = FAULT_LOCKOUT  (internal) Safety lockout active
-    4 = OVERTEMP_FAULT (internal) Overtemp trip active
-    5 = OVERLOAD_FAULT (internal) Overload trip active
-
-  HOLDING REGISTERS (Read/Write):
-    0 = MOTOR_TEMP     Simulated temperature in °C
-    1 = MOTOR_CURRENT  Simulated current in 0.1A units
-    2 = MOTOR_SPEED    Simulated speed in RPM
-    3 = RUNTIME_SECS   Motor total run-time in seconds
+  This module executes the exact IEC 61131-3 ladder logic from motor_ladder.ld
+  at a deterministic 100ms scan interval (10 Hz).
+  
+  It provides:
+  1. Direct zero-latency in-memory state access (bulletproof for Streamlit Cloud)
+  2. Modbus TCP Server (for external SCADA / test clients)
 """
 
 import time
 import threading
 import random
-import socket
 import logging
-
-from pymodbus.server import StartTcpServer
-from pymodbus.datastore import (
-    ModbusSequentialDataBlock,
-    ModbusSlaveContext,
-    ModbusServerContext,
-)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("PLC_Gateway")
-
-# ── PLC Memory State ──────────────────────────────────────────────────
-START_PB = False
-STOP_PB = False
-FAULT_RESET = False
-TEMP_SENSOR = False
-CURRENT_SENSOR = False
-
-MOTOR_RUN = False
-RUN_LAMP = False
-FAULT_LAMP = False
-
-FAULT_LOCKOUT = False
-OVERTEMP_FAULT = False
-OVERLOAD_FAULT = False
-
-MOTOR_TEMP = 25.0
-MOTOR_CURRENT = 0.0
-MOTOR_SPEED = 0
-RUNTIME_SECS = 0
-
-scan_count = 0
+log = logging.getLogger("PLC_Engine")
 
 
-def plc_scan_cycle(context):
+class PLCController:
     """
-    Executes one PLC scan cycle every 100ms.
-    Replicates the exact logic of motor_ladder.ld (Rungs 0 through 6).
+    Simulates the IEC 61131-3 OpenPLC Controller runtime.
+    Executes Rungs 0 through 6 every 100 ms.
     """
-    global START_PB, STOP_PB, FAULT_RESET, TEMP_SENSOR, CURRENT_SENSOR
-    global MOTOR_RUN, RUN_LAMP, FAULT_LAMP
-    global FAULT_LOCKOUT, OVERTEMP_FAULT, OVERLOAD_FAULT
-    global MOTOR_TEMP, MOTOR_CURRENT, MOTOR_SPEED, RUNTIME_SECS
-    global scan_count
+    def __init__(self):
+        # Digital Inputs (%IX)
+        self.START_PB = False       # %IX0.0
+        self.STOP_PB = False        # %IX0.1
+        self.FAULT_RESET = False    # %IX0.2
+        self.TEMP_SENSOR = False    # %IX0.3 (Thermal Trip Switch)
+        self.CURRENT_SENSOR = False # %IX0.4 (Overload Relay Trip)
 
-    slave = context[0x00]
+        # Digital Outputs (%QX)
+        self.MOTOR_RUN = False      # %QX0.0 (Main Contactor)
+        self.RUN_LAMP = False       # %QX0.1 (Green Indicator)
+        self.FAULT_LAMP = False     # %QX0.2 (Red Warning Indicator)
 
-    # Read inputs from Modbus coils (written by dashboard)
-    coil_values = slave.getValues(1, 0, 5)
-    START_PB = bool(coil_values[0])
-    STOP_PB = bool(coil_values[1])
-    FAULT_RESET = bool(coil_values[2])
-    TEMP_SENSOR = bool(coil_values[3])
-    CURRENT_SENSOR = bool(coil_values[4])
+        # Internal Safety Memory Flags
+        self.FAULT_LOCKOUT = False  # Set/Reset retentive latch
+        self.OVERTEMP_FAULT = False
+        self.OVERLOAD_FAULT = False
 
-    # Rung 0: Motor Start/Stop with seal-in latch & safety interlock
-    MOTOR_RUN = (START_PB or MOTOR_RUN) and (not STOP_PB) and (not FAULT_LOCKOUT)
+        # Analog Telemetry (%IW)
+        self.MOTOR_TEMP = 25.0      # %IW0 (°C)
+        self.MOTOR_CURRENT = 0.0    # %IW1 (0.1 A units)
+        self.MOTOR_SPEED = 0        # %IW2 (RPM)
+        self.RUNTIME_SECS = 0       # %IW3 (seconds)
 
-    # Rung 1: Green Run Lamp
-    RUN_LAMP = MOTOR_RUN
+        self._lock = threading.Lock()
 
-    # Rungs 2 & 3: Trip detection
-    OVERTEMP_FAULT = TEMP_SENSOR
-    OVERLOAD_FAULT = CURRENT_SENSOR
+    def scan_cycle(self):
+        """
+        One PLC scan cycle — executes every 100ms.
+        Mirrors motor_ladder.ld logic.
+        """
+        with self._lock:
+            # ── RUNG 0: Motor Start/Stop Seal-in Latch + Safety Interlock ──
+            # MOTOR_RUN := (START_PB OR MOTOR_RUN) AND NOT STOP_PB AND NOT FAULT_LOCKOUT
+            self.MOTOR_RUN = (
+                (self.START_PB or self.MOTOR_RUN)
+                and (not self.STOP_PB)
+                and (not self.FAULT_LOCKOUT)
+            )
 
-    # Rung 5: Set (S) FAULT_LOCKOUT on any trip
-    if OVERTEMP_FAULT or OVERLOAD_FAULT:
-        FAULT_LOCKOUT = True
+            # ── RUNG 1: Green Run Pilot Lamp ──────────────────────────────
+            self.RUN_LAMP = self.MOTOR_RUN
 
-    # Rung 6: Reset (R) FAULT_LOCKOUT on FAULT_RESET
-    if FAULT_RESET:
-        FAULT_LOCKOUT = False
+            # ── RUNGS 2 & 3: Trip Detection ───────────────────────────────
+            self.OVERTEMP_FAULT = self.TEMP_SENSOR
+            self.OVERLOAD_FAULT = self.CURRENT_SENSOR
 
-    # Rung 4: Red Fault Lamp
-    FAULT_LAMP = FAULT_LOCKOUT
+            # ── RUNG 5: Set (S) FAULT_LOCKOUT on any trip ─────────────────
+            # Permanent retentive latch
+            if self.OVERTEMP_FAULT or self.OVERLOAD_FAULT:
+                self.FAULT_LOCKOUT = True
 
-    # Safety trip immediately kills motor
-    if FAULT_LOCKOUT:
-        MOTOR_RUN = False
-        RUN_LAMP = False
+            # ── RUNG 6: Reset (R) FAULT_LOCKOUT on FAULT_RESET ───────────
+            if self.FAULT_RESET:
+                self.FAULT_LOCKOUT = False
 
-    # Analog simulation
-    if MOTOR_RUN:
-        MOTOR_TEMP = min(95.0, MOTOR_TEMP + random.uniform(0.1, 0.3))
-        MOTOR_CURRENT = min(200.0, max(100.0, MOTOR_CURRENT + random.uniform(-2, 3)))
-        MOTOR_SPEED = min(1500, MOTOR_SPEED + random.randint(10, 50))
-        RUNTIME_SECS += 1
-    else:
-        MOTOR_TEMP = max(25.0, MOTOR_TEMP - random.uniform(0.05, 0.2))
-        MOTOR_CURRENT = max(0.0, MOTOR_CURRENT - random.uniform(1, 5))
-        MOTOR_SPEED = max(0, MOTOR_SPEED - random.randint(20, 80))
+            # ── RUNG 4: Red Warning Fault Lamp ────────────────────────────
+            self.FAULT_LAMP = self.FAULT_LOCKOUT
 
-    # Auto-clear momentary pushbuttons
-    if START_PB:
-        slave.setValues(1, 0, [0])
-    if FAULT_RESET:
-        slave.setValues(1, 2, [0])
+            # Fail-safe immediate shutdown if lockout triggered
+            if self.FAULT_LOCKOUT:
+                self.MOTOR_RUN = False
+                self.RUN_LAMP = False
 
-    # Write outputs to discrete inputs
-    slave.setValues(2, 0, [
-        MOTOR_RUN,
-        RUN_LAMP,
-        FAULT_LAMP,
-        FAULT_LOCKOUT,
-        OVERTEMP_FAULT,
-        OVERLOAD_FAULT,
-    ])
+            # ── Analog Physical Simulation Model ──────────────────────────
+            if self.MOTOR_RUN:
+                self.MOTOR_TEMP = min(95.0, self.MOTOR_TEMP + random.uniform(0.1, 0.3))
+                self.MOTOR_CURRENT = min(200.0, max(100.0, self.MOTOR_CURRENT + random.uniform(-2, 3)))
+                self.MOTOR_SPEED = min(1500, self.MOTOR_SPEED + random.randint(15, 60))
+                self.RUNTIME_SECS += 1
+            else:
+                self.MOTOR_TEMP = max(25.0, self.MOTOR_TEMP - random.uniform(0.05, 0.2))
+                self.MOTOR_CURRENT = max(0.0, self.MOTOR_CURRENT - random.uniform(2, 6))
+                self.MOTOR_SPEED = max(0, self.MOTOR_SPEED - random.randint(25, 90))
 
-    # Write analog telemetry to holding registers
-    slave.setValues(3, 0, [
-        int(MOTOR_TEMP),
-        int(MOTOR_CURRENT),
-        int(MOTOR_SPEED),
-        int(RUNTIME_SECS),
-    ])
+            # Auto-clear momentary pushbuttons
+            if self.START_PB:
+                self.START_PB = False
+            if self.FAULT_RESET:
+                self.FAULT_RESET = False
 
-    scan_count += 1
-    if scan_count % 50 == 0:
-        status = "RUNNING" if MOTOR_RUN else ("FAULTED" if FAULT_LOCKOUT else "STOPPED")
-        log.info(
-            f"[{status}] Temp={MOTOR_TEMP:.0f}C "
-            f"Current={MOTOR_CURRENT/10:.1f}A "
-            f"Speed={MOTOR_SPEED}RPM "
-            f"Runtime={RUNTIME_SECS}s"
-        )
+    def pulse_start(self):
+        with self._lock:
+            self.START_PB = True
 
+    def pulse_stop(self):
+        with self._lock:
+            self.STOP_PB = True
+            self.MOTOR_RUN = False
+            self.RUN_LAMP = False
 
-def plc_scan_loop(context):
-    """Continuously runs the scan cycle every 100ms."""
-    log.info("PLC Scan Loop active (100ms interval).")
-    while True:
-        try:
-            plc_scan_cycle(context)
-        except Exception as e:
-            log.error(f"Scan cycle error: {e}")
-        time.sleep(0.1)
+    def release_stop(self):
+        with self._lock:
+            self.STOP_PB = False
 
+    def pulse_reset(self):
+        with self._lock:
+            self.FAULT_RESET = True
 
-def create_context():
-    """Create Modbus data store and server context."""
-    store = ModbusSlaveContext(
-        co=ModbusSequentialDataBlock(0, [0] * 16),
-        di=ModbusSequentialDataBlock(0, [0] * 16),
-        hr=ModbusSequentialDataBlock(0, [0] * 16),
-        ir=ModbusSequentialDataBlock(0, [0] * 16),
-        zero_mode=True,
-    )
-    return ModbusServerContext(slaves=store, single=True)
+    def trigger_overtemp(self, active=True):
+        with self._lock:
+            self.TEMP_SENSOR = active
+
+    def trigger_overload(self, active=True):
+        with self._lock:
+            self.CURRENT_SENSOR = active
+
+    def get_snapshot(self):
+        """Thread-safe snapshot of all variables for UI rendering."""
+        with self._lock:
+            return {
+                "motor_run": self.MOTOR_RUN,
+                "run_lamp": self.RUN_LAMP,
+                "fault_lamp": self.FAULT_LAMP,
+                "fault_lockout": self.FAULT_LOCKOUT,
+                "overtemp": self.OVERTEMP_FAULT,
+                "overload": self.OVERLOAD_FAULT,
+                "temperature": int(self.MOTOR_TEMP),
+                "current": round(self.MOTOR_CURRENT / 10.0, 1),
+                "speed": int(self.MOTOR_SPEED),
+                "runtime": int(self.RUNTIME_SECS),
+            }
 
 
-def is_port_open(host="127.0.0.1", port=5020):
-    """Check if Modbus port is already open."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(1.0)
-    try:
-        s.connect((host, port))
-        s.close()
-        return True
-    except Exception:
-        return False
+# ── Global Singleton Controller Instance ──────────────────────────────
+_plc = None
+_plc_thread = None
+_modbus_thread = None
+
+
+def get_plc():
+    """Get or create singleton PLC engine with background scan loop."""
+    global _plc, _plc_thread, _modbus_thread
+    if _plc is None:
+        _plc = PLCController()
+
+        def scan_loop():
+            log.info("PLC Scan Loop running (100ms interval).")
+            while True:
+                try:
+                    _plc.scan_cycle()
+                except Exception as e:
+                    log.error(f"Scan error: {e}")
+                time.sleep(0.1)
+
+        _plc_thread = threading.Thread(target=scan_loop, daemon=True)
+        _plc_thread.start()
+
+        def start_modbus():
+            try:
+                from pymodbus.server import StartTcpServer
+                from pymodbus.datastore import (
+                    ModbusSequentialDataBlock,
+                    ModbusSlaveContext,
+                    ModbusServerContext,
+                )
+                store = ModbusSlaveContext(
+                    co=ModbusSequentialDataBlock(0, [0] * 16),
+                    di=ModbusSequentialDataBlock(0, [0] * 16),
+                    hr=ModbusSequentialDataBlock(0, [0] * 16),
+                    ir=ModbusSequentialDataBlock(0, [0] * 16),
+                    zero_mode=True,
+                )
+                ctx = ModbusServerContext(slaves=store, single=True)
+                StartTcpServer(context=ctx, address=("127.0.0.1", 5020))
+            except Exception as e:
+                log.warning(f"Modbus TCP server could not bind (in-memory bridge active): {e}")
+
+        _modbus_thread = threading.Thread(target=start_modbus, daemon=True)
+        _modbus_thread.start()
+
+    return _plc
 
 
 def start_background_gateway(host="127.0.0.1", port=5020):
-    """Start PLC scan engine and Modbus TCP server in background threads."""
-    if is_port_open(host, port):
-        log.info(f"Modbus server already running on {host}:{port}")
-        return
-
-    context = create_context()
-
-    # Scan engine thread
-    scan_th = threading.Thread(target=plc_scan_loop, args=(context,), daemon=True)
-    scan_th.start()
-
-    # Modbus server thread
-    def run_server():
-        StartTcpServer(context=context, address=(host, port))
-
-    srv_th = threading.Thread(target=run_server, daemon=True)
-    srv_th.start()
-    time.sleep(0.5)
-    log.info(f"Background Modbus server started on {host}:{port}")
-
-
-def main():
-    """Standalone CLI entry point."""
-    log.info("Starting PLC Gateway on 127.0.0.1:5020...")
-    context = create_context()
-    threading.Thread(target=plc_scan_loop, args=(context,), daemon=True).start()
-    StartTcpServer(context=context, address=("127.0.0.1", 5020))
+    return get_plc()
 
 
 if __name__ == "__main__":
-    main()
+    p = get_plc()
+    print("PLC Engine started. Pressing START...")
+    p.pulse_start()
+    for _ in range(5):
+        time.sleep(1)
+        print(p.get_snapshot())

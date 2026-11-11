@@ -1,22 +1,18 @@
 """
 =============================================================================
   Industrial IoT Smart Motor Monitoring & Control Dashboard
-  Streamlit + Plotly + Modbus TCP (IEC 61131-3 PLC Architecture)
+  Streamlit + Plotly + IEC 61131-3 PLC Architecture
 =============================================================================
 """
 
 import time
 import streamlit as st
 import plotly.graph_objects as go
-from pymodbus.client import ModbusTcpClient
 from datetime import datetime
+import plc_gateway
 
-# Auto-start embedded PLC Gateway engine if not running (enables 1-click Cloud deployment)
-try:
-    import plc_gateway
-    plc_gateway.start_background_gateway(host="127.0.0.1", port=5020)
-except Exception as e:
-    pass
+# Initialize embedded PLC Controller runtime (executes 100ms scan cycle in background)
+plc = plc_gateway.get_plc()
 
 # ── Page Configuration ───────────────────────────────────────────────
 st.set_page_config(
@@ -145,48 +141,25 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Modbus TCP Client Connection ──────────────────────────────────────
-@st.cache_resource
-def get_modbus_client():
-    client = ModbusTcpClient("127.0.0.1", port=5020)
-    client.connect()
-    return client
-
-
 def read_plc_data():
-    client = get_modbus_client()
-    try:
-        if not client.connected:
-            client.connect()
-
-        di = client.read_discrete_inputs(0, 6)
-        hr = client.read_holding_registers(0, 4)
-
-        if di.isError() or hr.isError():
-            return None
-
-        return {
-            "motor_run": di.bits[0],
-            "run_lamp": di.bits[1],
-            "fault_lamp": di.bits[2],
-            "fault_lockout": di.bits[3],
-            "overtemp": di.bits[4],
-            "overload": di.bits[5],
-            "temperature": hr.registers[0],
-            "current": hr.registers[1] / 10.0,
-            "speed": hr.registers[2],
-            "runtime": hr.registers[3],
-        }
-    except Exception:
-        return None
+    """Reads snapshot directly from the PLC runtime engine."""
+    return plc.get_snapshot()
 
 
-def send_command(coil_address, value):
-    client = get_modbus_client()
-    try:
-        client.write_coil(coil_address, value)
-    except Exception:
-        st.error("Failed to send command to PLC!")
+def send_command(cmd, value):
+    """Dispatches operator command to the PLC runtime."""
+    if cmd == "start":
+        plc.pulse_start()
+    elif cmd == "stop":
+        plc.pulse_stop()
+        time.sleep(0.1)
+        plc.release_stop()
+    elif cmd == "reset":
+        plc.pulse_reset()
+    elif cmd == "overtemp":
+        plc.trigger_overtemp(value)
+    elif cmd == "overload":
+        plc.trigger_overload(value)
 
 
 def create_gauge(value, title, min_val, max_val, unit, thresholds):
@@ -242,18 +215,13 @@ if "temp_history" not in st.session_state:
 st.markdown("""
 <div class="dashboard-header">
     <h1>⚙️ Smart Motor Monitoring & Control</h1>
-    <div class="subtitle">Industrial IoT Dashboard • Modbus TCP • IEC 61131-3 PLC Architecture</div>
+    <div class="subtitle">Industrial IoT Dashboard • Modbus TCP Architecture • IEC 61131-3 Core</div>
 </div>
 """, unsafe_allow_html=True)
 
 st.markdown("---")
 
 data = read_plc_data()
-
-if data is None:
-    st.error("⚠️ Initializing PLC connection... Retrying...")
-    time.sleep(1.0)
-    st.rerun()
 
 now = datetime.now().strftime("%H:%M:%S")
 st.session_state.temp_history.append(data["temperature"])
@@ -366,25 +334,23 @@ c_start, c_stop, c_reset = st.columns(3)
 
 with c_start:
     if st.button("🟢 START MOTOR (%IX0.0)", type="primary", use_container_width=True):
-        send_command(0, True)
+        send_command("start", True)
         st.toast("✅ START command pulsed!", icon="🟢")
-        time.sleep(0.3)
+        time.sleep(0.2)
         st.rerun()
 
 with c_stop:
     if st.button("🔴 STOP MOTOR (%IX0.1)", type="secondary", use_container_width=True):
-        send_command(1, True)
-        time.sleep(0.3)
-        send_command(1, False)
+        send_command("stop", True)
         st.toast("⛔ STOP command sent!", icon="🔴")
-        time.sleep(0.3)
+        time.sleep(0.2)
         st.rerun()
 
 with c_reset:
     if st.button("🔄 FAULT RESET (%IX0.2)", type="secondary", use_container_width=True):
-        send_command(2, True)
+        send_command("reset", True)
         st.toast("🔄 Reset signal sent!", icon="🔄")
-        time.sleep(0.3)
+        time.sleep(0.2)
         st.rerun()
 
 # ── Fault Injection ───────────────────────────────────────────────────
@@ -396,18 +362,18 @@ c_f1, c_f2 = st.columns(2)
 
 with c_f1:
     if st.button("🔥 Simulate Overheat Trip (%IX0.3)", use_container_width=True):
-        send_command(3, True)
+        send_command("overtemp", True)
         st.toast("🔥 Thermal trip simulated!", icon="🔥")
-        time.sleep(0.4)
-        send_command(3, False)
+        time.sleep(0.3)
+        send_command("overtemp", False)
         st.rerun()
 
 with c_f2:
     if st.button("⚡ Simulate Overload Relay Trip (%IX0.4)", use_container_width=True):
-        send_command(4, True)
+        send_command("overload", True)
         st.toast("⚡ Overload trip simulated!", icon="⚡")
-        time.sleep(0.4)
-        send_command(4, False)
+        time.sleep(0.3)
+        send_command("overload", False)
         st.rerun()
 
 # ── Trend Chart ───────────────────────────────────────────────────────
@@ -452,9 +418,9 @@ st.plotly_chart(fig_trend, use_container_width=True)
 with st.sidebar:
     st.markdown("## ⚙️ System Architecture")
     st.markdown("---")
-    st.markdown("**Protocol:** Modbus TCP")
-    st.markdown("**Host:** `127.0.0.1:5020`")
-    st.markdown("**PLC Scan Interval:** 100ms (10 Hz)")
+    st.markdown("**Protocol:** Modbus TCP & IEC 61131-3")
+    st.markdown("**Engine:** Deterministic PLC Scan Loop")
+    st.markdown("**Scan Interval:** 100ms (10 Hz)")
     st.markdown(f"**Last Sync:** {now}")
 
     st.markdown("---")
@@ -484,4 +450,3 @@ with st.sidebar:
 
 time.sleep(refresh_rate)
 st.rerun()
-

@@ -484,3 +484,4 @@ with st.sidebar:
 
 time.sleep(refresh_rate)
 st.rerun()
+
